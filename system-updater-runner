@@ -1,0 +1,699 @@
+#!/usr/bin/env bash
+#
+# System Update Runner
+# A portable Linux GUI system update manager supporting APT, Pacman, Yay,
+# Flatpak, and Snap with Zenity dialogs (and YAD fallback), live status
+# ticker output, optional logging, audio/desktop notifications, and reboot check.
+#
+# Version: 1.0.0
+#
+# Author:  M. Wait
+# GitHub:  https://github.com/cybermaxpower/System-Update-Runner
+# License: MIT License
+
+# Suppress GTK/Adwaita theme warning noise in terminal
+exec 2> >(grep -v -E "Gtk-WARNING|Adwaita-WARNING" >&2)
+
+# Refuse to run directly as root; privilege escalation is handled per operation
+if [ "$(id -u)" -eq 0 ]; then
+    echo "Error: Do not run System Update Runner as root. Run it as a regular user." >&2
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --error --title="System Updater" \
+            --text="Do not run System Update Runner as root.\n\nPlease run it as your normal user account." \
+            --icon="dialog-error" 2>/dev/null || true
+    elif command -v yad >/dev/null 2>&1; then
+        yad --center --error --title="System Updater" \
+            --text="Do not run System Update Runner as root.\n\nPlease run it as your normal user account." \
+            --window-icon="dialog-error" 2>/dev/null || true
+    fi
+    exit 1
+fi
+
+# Single-instance lock using flock when available
+LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/system-updater-runner-${UID}.lock"
+LOCK_FD=9
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCK_FILE"
+    if ! flock -n "$LOCK_FD"; then
+        echo "Error: Another instance of System Update Runner is already running." >&2
+        if command -v zenity >/dev/null 2>&1; then
+            zenity --info --title="System Updater" \
+                --text="System Update Runner is already running." \
+                --icon="dialog-information" 2>/dev/null || true
+        elif command -v yad >/dev/null 2>&1; then
+             yad --center  --info --title="System Updater" \
+                --text="System Update Runner is already running." \
+                --window-icon="dialog-information" 2>/dev/null || true
+        fi
+        exit 1
+    fi
+fi
+
+# Detect available GUI dialog engine (prefer Zenity, fall back to YAD)
+if command -v zenity >/dev/null 2>&1; then
+    GUI_ENGINE="zenity"
+elif command -v yad >/dev/null 2>&1; then
+    GUI_ENGINE="yad"
+else
+    echo "Error: Neither Zenity nor YAD is installed." >&2
+    exit 1
+fi
+
+# Automatically centre all YAD dialogs on screen
+if [ "$GUI_ENGINE" = "yad" ]; then
+    yad() {
+        command yad --center "$@"
+    }
+fi
+
+# Application-owned temporary file paths (populated safely via mktemp)
+STATUS_FILE=""
+RESULTS_FILE=""
+STREAM_FILE=""
+PASS_FILE=""
+ASKPASS_SCRIPT=""
+SOUND_PID=""
+WORKER_PID=""
+SUDO_KEEPALIVE_PID=""
+CLEANUP_DONE="FALSE"
+
+remove_temp_file() {
+    local target="$1"
+    case "$target" in
+        /tmp/*|"${TMPDIR:-/tmp}"/*)
+            [ -f "$target" ] && rm -f "$target"
+            ;;
+    esac
+}
+
+
+# Periodically refresh sudo credentials while updates are running
+sudo_keepalive_loop() {
+    local sleep_pid=""
+
+    # Stop the background sleep process cleanly when requested
+    trap '
+        if [ -n "$sleep_pid" ]; then
+            kill "$sleep_pid" 2>/dev/null || true
+            wait "$sleep_pid" 2>/dev/null || true
+        fi
+        exit 0
+    ' TERM
+
+    while :; do
+        # Use the saved password helper when available
+        if [ -n "${ASKPASS_SCRIPT:-}" ] && [ -x "$ASKPASS_SCRIPT" ]; then
+            SUDO_ASKPASS="$ASKPASS_SCRIPT" sudo -A -v -p '' 2>/dev/null || true
+        else
+            # Otherwise refresh existing cached credentials without prompting
+            sudo -n -v 2>/dev/null || true
+        fi
+
+        # Refresh every 60 seconds
+        sleep 60 &
+        sleep_pid=$!
+        wait "$sleep_pid" || true
+        sleep_pid=""
+    done
+}
+
+# Stop and reap the sudo keepalive process
+stop_sudo_keepalive() {
+    if [ -n "${SUDO_KEEPALIVE_PID:-}" ]; then
+        kill -TERM "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+        wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+        SUDO_KEEPALIVE_PID=""
+    fi
+}
+
+
+cleanup_resources() {
+    if [ "$CLEANUP_DONE" = "TRUE" ]; then
+        return 0
+    fi
+    if [ -n "${WORKER_PID:-}" ] && kill -0 "$WORKER_PID" 2>/dev/null; then
+       wait "$WORKER_PID" 2>/dev/null || true
+    fi
+
+    stop_sudo_keepalive
+
+    CLEANUP_DONE="TRUE"
+    unset SUDO_PASSWORD SUDO_ASKPASS 2>/dev/null || true
+    remove_temp_file "$PASS_FILE"
+    remove_temp_file "$ASKPASS_SCRIPT"
+    remove_temp_file "$STATUS_FILE"
+    remove_temp_file "$RESULTS_FILE"
+    remove_temp_file "$STREAM_FILE"
+}
+
+handle_interrupt() {
+    # Prevent repeated signal-handler execution
+    trap '' INT TERM HUP
+
+    # Allow active package operations to finish safely
+    if [ -n "${WORKER_PID:-}" ] && kill -0 "$WORKER_PID" 2>/dev/null; then
+        wait "$WORKER_PID" 2>/dev/null || true
+    fi
+
+    WORKER_PID=""
+
+    cleanup_resources
+    exit 130
+}
+
+trap cleanup_resources EXIT
+trap handle_interrupt INT TERM HUP
+
+STATUS_FILE=$(mktemp) || { echo "Error: Failed to create temporary status file." >&2; exit 1; }
+RESULTS_FILE=$(mktemp) || { echo "Error: Failed to create temporary results file." >&2; exit 1; }
+STREAM_FILE=$(mktemp) || { echo "Error: Failed to create temporary stream file." >&2; exit 1; }
+chmod 600 "$STATUS_FILE" "$RESULTS_FILE" "$STREAM_FILE" 2>/dev/null || true
+
+# Universal Notification Helper
+send_notification() {
+    local urgency="$1"
+    local title="$2"
+    local msg="$3"
+    local icon="$4"
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send -u "$urgency" -i "$icon" "$title" "$msg" &
+    fi
+}
+
+# Universal Audio Feedback Helper
+play_sound() {
+    local sound_type="$1"
+    local sound_file=""
+    SOUND_PID=""
+
+    if [ "$sound_type" = "success" ]; then
+        for f in /usr/share/sounds/freedesktop/stereo/complete.oga \
+                 /usr/share/sounds/gnome/default/alerts/glass.ogg \
+                 /usr/share/sounds/ubuntu/notifications/positive.ogg; do
+            [ -f "$f" ] && { sound_file="$f"; break; }
+        done
+    else
+        for f in /usr/share/sounds/freedesktop/stereo/dialog-warning.oga \
+                 /usr/share/sounds/gnome/default/alerts/bark.ogg \
+                 /usr/share/sounds/ubuntu/notifications/error.ogg; do
+            [ -f "$f" ] && { sound_file="$f"; break; }
+        done
+    fi
+
+    if [ -n "$sound_file" ]; then
+        if command -v paplay >/dev/null 2>&1; then
+            timeout 3 paplay "$sound_file" &
+            SOUND_PID=$!
+        elif command -v pw-play >/dev/null 2>&1; then
+            timeout 3 pw-play "$sound_file" &
+            SOUND_PID=$!
+        elif command -v aplay >/dev/null 2>&1; then
+            timeout 3 aplay -q "$sound_file" &
+            SOUND_PID=$!
+        fi
+    fi
+}
+
+# Exact selection check against pipe-delimited manager names
+is_manager_selected() {
+    local target="$1"
+    local IFS='|'
+    local item
+    for item in $SELECTED_MANAGERS; do
+        if [ "$item" = "$target" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+
+# Run privileged commands using AskPass when available,
+# otherwise use existing cached sudo credentials without prompting.
+run_privileged() {
+    if [ -n "${ASKPASS_SCRIPT:-}" ] && [ -x "$ASKPASS_SCRIPT" ]; then
+        SUDO_ASKPASS="$ASKPASS_SCRIPT" sudo -A -p '' "$@"
+    else
+        sudo -n "$@"
+    fi
+}
+
+# 1a. Parse Command Line Arguments
+ENABLE_LOGGING="FALSE"
+
+for arg in "$@"; do
+    case "$arg" in
+        -l|--log|/l)
+            ENABLE_LOGGING="TRUE"
+            ;;
+    esac
+done
+
+# 1b. Setup Log Location ONLY if enabled and writable
+LOG_FILE=""
+if [ "$ENABLE_LOGGING" = "TRUE" ]; then
+    LOG_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/system-updater/logs"
+    if mkdir -p "$LOG_DIR" 2>/dev/null && [ -w "$LOG_DIR" ]; then
+        LOG_FILE="$LOG_DIR/update_$(date +'%Y-%m-%d_%H-%M-%S').log"
+        # Automatically purge only this application's logs older than 30 days
+        find "$LOG_DIR" -maxdepth 1 -type f -name "update_*.log" -mtime +30 -delete 2>/dev/null || true
+    else
+        ENABLE_LOGGING="FALSE"
+        [ -t 1 ] && echo "Warning: Could not create or write to log directory: $LOG_DIR" >&2
+    fi
+fi
+
+# 2. Detect installed package managers
+APT_STATUS="FALSE"
+PACMAN_STATUS="FALSE"
+YAY_STATUS="FALSE"
+FLATPAK_STATUS="FALSE"
+SNAP_STATUS="FALSE"
+
+command -v apt-get >/dev/null 2>&1 && APT_STATUS="TRUE"
+command -v pacman >/dev/null 2>&1 && PACMAN_STATUS="TRUE"
+command -v yay >/dev/null 2>&1 && YAY_STATUS="TRUE"
+command -v flatpak >/dev/null 2>&1 && FLATPAK_STATUS="TRUE"
+command -v snap >/dev/null 2>&1 && SNAP_STATUS="TRUE"
+
+# 3. Present checklist selection dynamically based on engine
+CHECKLIST_ITEMS=()
+[ "$APT_STATUS" = "TRUE" ] && CHECKLIST_ITEMS+=("TRUE" "APT" "Debian/Ubuntu system packages")
+[ "$PACMAN_STATUS" = "TRUE" ] && [ "$YAY_STATUS" = "FALSE" ] && CHECKLIST_ITEMS+=("TRUE" "Pacman" "Arch system packages")
+[ "$YAY_STATUS" = "TRUE" ] && CHECKLIST_ITEMS+=("TRUE" "Yay" "Arch system packages & AUR helper")
+[ "$FLATPAK_STATUS" = "TRUE" ] && CHECKLIST_ITEMS+=("TRUE" "Flatpak" "Flatpak application updates")
+[ "$SNAP_STATUS" = "TRUE" ] && CHECKLIST_ITEMS+=("TRUE" "Snap" "Snap package updates")
+
+if [ "${#CHECKLIST_ITEMS[@]}" -eq 0 ]; then
+    play_sound "error"
+    send_notification "critical" "System Updater" "No supported package managers found." "dialog-error"
+    if [ -n "${SOUND_PID:-}" ]; then
+        wait "$SOUND_PID" 2>/dev/null || true
+    fi
+    exit 1
+fi
+
+SELECTED_MANAGERS=""
+DIALOG_RC=0
+
+if [ "$GUI_ENGINE" = "yad" ]; then
+    SELECTED_MANAGERS=$(yad --list --checklist \
+        --title="System Update Manager" \
+        --text="Select updates to run:" \
+        --column="Select" --column="Package Manager" --column="Description" \
+        --print-column=2 --separator="|" \
+        "${CHECKLIST_ITEMS[@]}" \
+        --width=500 --height=320 --window-icon="system-software-update")
+    DIALOG_RC=$?
+else
+    SELECTED_MANAGERS=$(zenity --list --checklist \
+        --title="System Update Manager" \
+        --text="Select updates to run:" \
+        --column="Select" --column="Package Manager" --column="Description" \
+        --print-column=2 --separator="|" \
+        "${CHECKLIST_ITEMS[@]}" \
+        --width=500 --height=320 --icon="system-software-update")
+    DIALOG_RC=$?
+fi
+
+if [ "$DIALOG_RC" -ne 0 ] || [ -z "$SELECTED_MANAGERS" ]; then
+    exit 0
+fi
+
+# 4. Authenticate if privileged or sudo-invoking managers are selected
+NEED_SUDO="FALSE"
+if is_manager_selected "APT" || is_manager_selected "Pacman" || is_manager_selected "Yay" || is_manager_selected "Snap"; then
+    NEED_SUDO="TRUE"
+fi
+
+if [ "$NEED_SUDO" = "TRUE" ]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "Error: sudo is required for selected package managers but is not installed." >&2
+        if [ "$GUI_ENGINE" = "yad" ]; then
+            yad --error --title="Missing Dependency" \
+                --text="sudo is required for the selected update operations." \
+                --window-icon="dialog-error"
+        else
+            zenity --error --title="Missing Dependency" \
+                --text="sudo is required for the selected update operations." \
+                --icon="dialog-error"
+        fi
+        exit 1
+    fi
+
+# Check and refresh existing sudo credentials without prompting
+    if ! sudo -n -v 2>/dev/null; then
+        SUDO_PASSWORD=""
+        AUTH_RC=0
+        if [ "$GUI_ENGINE" = "yad" ]; then
+            SUDO_PASSWORD=$(yad --entry --hide-text \
+                --title="Authentication Required" \
+                --text="Enter administrative password to perform updates:" \
+                --width=380 \
+                --window-icon="dialog-password")
+            AUTH_RC=$?
+        else
+            SUDO_PASSWORD=$(zenity --password \
+                --title="Authentication Required" \
+                --icon="dialog-password")
+            AUTH_RC=$?
+        fi
+
+        if [ "$AUTH_RC" -ne 0 ] || [ -z "$SUDO_PASSWORD" ]; then
+            unset SUDO_PASSWORD
+            exit 0
+        fi
+
+        if ! printf '%s\n' "$SUDO_PASSWORD" | sudo -S -v 2>/dev/null; then
+            unset SUDO_PASSWORD
+            if [ "$GUI_ENGINE" = "yad" ]; then
+                yad --error --title="Auth Failed" --text="Incorrect password entered." --window-icon="dialog-error"
+            else
+                zenity --error --title="Auth Failed" --text="Incorrect password entered." --icon="dialog-error"
+            fi
+            exit 1
+        fi
+
+        PASS_FILE=$(mktemp) || { unset SUDO_PASSWORD; echo "Error: Failed to create temporary password file." >&2; exit 1; }
+        chmod 600 "$PASS_FILE"
+        printf '%s\n' "$SUDO_PASSWORD" > "$PASS_FILE"
+        unset SUDO_PASSWORD
+
+        ASKPASS_SCRIPT=$(mktemp) || { echo "Error: Failed to create temporary askpass helper." >&2; exit 1; }
+        chmod 700 "$ASKPASS_SCRIPT"
+        cat <<EOF > "$ASKPASS_SCRIPT"
+#!/usr/bin/env bash
+if [ -r "$PASS_FILE" ]; then
+    cat "$PASS_FILE"
+fi
+EOF
+    fi
+fi
+
+send_notification "normal" "System Update Started" "Running selected updates..." "system-software-update"
+
+# Feed live status ticker lines to Zenity/YAD
+stream_output() {
+    while IFS= read -r line; do
+                if [[ "$line" =~ ^# ]] || [[ "$line" =~ ^[0-9]{1,3}$ ]]; then
+            printf '%s\n' "$line"
+        elif [[ "$line" =~ ^(Get|Hit|Ign):[0-9]+[[:space:]]+([^[:space:]]+) ]]; then
+            repo_url="${BASH_REMATCH[2]}"
+            repo_host=$(printf '%s\n' "$repo_url" | awk -F/ '{print $3}')
+            if [ -n "$repo_host" ]; then
+                printf '# Checking repository: %s...\n' "$repo_host"
+            fi
+        elif [[ "$line" =~ ^Unpacking[[:space:]]+([^[:space:]]+) ]]; then
+            printf '# Unpacking: %s...\n' "${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^Setting\ up[[:space:]]+([^[:space:]]+) ]]; then
+            printf '# Configuring: %s...\n' "${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^(Installing|Updating|Downloading)[[:space:]]+([^[:space:]]+) ]]; then
+            printf '# %s: %s...\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+        elif [[ "$line" =~ ^::[[:space:]]+(.*) ]]; then
+            printf '# %s\n' "${BASH_REMATCH[1]}"
+        fi
+    done
+}
+
+# 5. Execute updates in an independent worker writing to STREAM_FILE so closing
+# the progress window never breaks a pipeline or interrupts package transactions
+run_updates() {
+    local worker_exit=0
+    local apt_msg=""
+    local pacman_msg=""
+    local yay_msg=""
+    local flatpak_msg=""
+    local snap_msg=""
+    local cmd_rc=0
+
+   # Make the AskPass helper available to child processes,
+   # including Yay and its privileged commands.
+   if [[ -n "${ASKPASS_SCRIPT:-}" && -x "$ASKPASS_SCRIPT" ]]; then
+       export SUDO_ASKPASS="$ASKPASS_SCRIPT"
+   fi
+
+    printf '# === System Update Log: %s ===\n' "$(date)"
+    [ "$ENABLE_LOGGING" = "TRUE" ] && [ -n "$LOG_FILE" ] && printf '# Saving output to: %s\n' "$LOG_FILE"
+
+    if is_manager_selected "APT"; then
+        printf '# Refreshing APT repositories...\n'
+        run_privileged apt-get update -y 2>&1
+        cmd_rc=$?
+        if [ "$cmd_rc" -ne 0 ]; then
+            apt_msg="APT: Failed (repo refresh)"
+            worker_exit=1
+        else
+            printf '# Upgrading APT packages...\n'
+            run_privileged apt-get upgrade -y 2>&1
+            cmd_rc=$?
+            if [ "$cmd_rc" -ne 0 ]; then
+                apt_msg="APT: Failed (upgrade)"
+                worker_exit=1
+            else
+                apt_msg="APT: OK"
+            fi
+        fi
+    fi
+
+    if is_manager_selected "Pacman"; then
+        printf '# Updating Pacman packages...\n'
+        run_privileged pacman -Syu --noconfirm 2>&1
+        cmd_rc=$?
+        if [ "$cmd_rc" -ne 0 ]; then
+            pacman_msg="Pacman: Failed"
+            worker_exit=1
+        else
+            pacman_msg="Pacman: OK"
+        fi
+    fi
+
+    if is_manager_selected "Yay"; then
+        printf '# Updating Arch & AUR packages...\n'
+        if [ -n "$ASKPASS_SCRIPT" ] && [ -x "$ASKPASS_SCRIPT" ]; then
+            yay -Syu --noconfirm --sudo sudo --sudoflags -A 2>&1
+        else
+            yay -Syu --noconfirm 2>&1
+        fi
+        cmd_rc=$?
+        if [ "$cmd_rc" -ne 0 ]; then
+            yay_msg="Yay: Failed"
+            worker_exit=1
+        else
+            yay_msg="Yay: OK"
+        fi
+    fi
+
+    if is_manager_selected "Flatpak"; then
+        printf '# Updating Flatpak applications...\n'
+        flatpak update -y 2>&1
+        cmd_rc=$?
+        if [ "$cmd_rc" -ne 0 ]; then
+            flatpak_msg="Flatpak: Failed"
+            worker_exit=1
+        else
+            flatpak_msg="Flatpak: OK"
+        fi
+    fi
+
+    if is_manager_selected "Snap"; then
+        printf '# Updating Snap packages...\n'
+        run_privileged snap refresh 2>&1
+        cmd_rc=$?
+        if [ "$cmd_rc" -ne 0 ]; then
+            snap_msg="Snap: Failed"
+            worker_exit=1
+        else
+            snap_msg="Snap: OK"
+        fi
+    fi
+
+    {
+        [ -n "$apt_msg" ] && printf '%s\n' "$apt_msg"
+        [ -n "$pacman_msg" ] && printf '%s\n' "$pacman_msg"
+        [ -n "$yay_msg" ] && printf '%s\n' "$yay_msg"
+        [ -n "$flatpak_msg" ] && printf '%s\n' "$flatpak_msg"
+        [ -n "$snap_msg" ] && printf '%s\n' "$snap_msg"
+    } > "$RESULTS_FILE"
+
+    printf '%s\n' "$worker_exit" > "$STATUS_FILE"
+
+    # 3-second countdown before closing the progress window
+    for sec in 3 2 1; do
+        printf '# Operations completed. Closing in %ss...\n' "$sec"
+        sleep 1
+    done
+
+    printf '100\n'
+}
+
+run_updates > "$STREAM_FILE" 2>&1 &
+WORKER_PID=$!
+
+# Keep sudo credentials alive during privileged update operations
+if [ "$NEED_SUDO" = "TRUE" ]; then
+    sudo_keepalive_loop &
+    SUDO_KEEPALIVE_PID=$!
+fi
+
+# Tail STREAM_FILE into the progress dialog without terminating WORKER_PID if dialog closes
+if [ "$GUI_ENGINE" = "yad" ]; then
+    tail -n +1 -f --pid="$WORKER_PID" "$STREAM_FILE" 2>/dev/null | stream_output | yad --progress \
+        --title="System Updater" \
+        --text="Initializing update process..." \
+        --width=550 \
+        --pulsate \
+        --auto-close \
+        --no-buttons \
+        --window-icon="system-software-update" >/dev/null 2>&1 || true
+else
+    tail -n +1 -f --pid="$WORKER_PID" "$STREAM_FILE" 2>/dev/null | stream_output | zenity --progress \
+        --title="System Updater" \
+        --text="Initializing update process..." \
+        --width=500 \
+        --pulsate \
+        --auto-close \
+        --no-cancel \
+        --icon="system-software-update" >/dev/null 2>&1 || true
+fi
+
+# Wait for the update worker to finish before processing results
+wait "$WORKER_PID" 2>/dev/null || true
+WORKER_PID=""
+
+# Stop sudo keepalive once updates have finished
+stop_sudo_keepalive
+
+# Save complete worker output to the log after the update worker finishes
+if [ "$ENABLE_LOGGING" = "TRUE" ] && [ -n "$LOG_FILE" ]; then
+    if ! cat "$STREAM_FILE" >> "$LOG_FILE"; then
+        echo "Warning: Unable to write update log: $LOG_FILE" >&2
+    fi
+fi
+
+# Validate STATUS_FILE and RESULTS_FILE before trusting success
+if [ -s "$STATUS_FILE" ] && grep -qxE '^[01]$' "$STATUS_FILE"; then
+    UPDATE_EXIT_CODE=$(<"$STATUS_FILE")
+else
+    UPDATE_EXIT_CODE=1
+fi
+
+if [ ! -s "$RESULTS_FILE" ]; then
+    UPDATE_EXIT_CODE=1
+fi
+
+SUMMARY_LINES=""
+if [ -s "$RESULTS_FILE" ]; then
+    while IFS= read -r entry; do
+        [ -z "$entry" ] && continue
+        if [ -z "$SUMMARY_LINES" ]; then
+            SUMMARY_LINES="$entry"
+        else
+            SUMMARY_LINES="${SUMMARY_LINES}, ${entry}"
+        fi
+    done < "$RESULTS_FILE"
+fi
+
+# 6. Evaluate actual result and report per-manager status
+if [ "$UPDATE_EXIT_CODE" -eq 0 ]; then
+    play_sound "success"
+    NOTIF_BODY="All selected packages have been updated."
+    [ -n "$SUMMARY_LINES" ] && NOTIF_BODY="${SUMMARY_LINES}"
+    send_notification "normal" "System Update Complete" "$NOTIF_BODY" "dialog-information"
+else
+    play_sound "error"
+    send_notification "critical" "System Update Finished with Errors" "One or more update tasks encountered errors." "dialog-error"
+
+    TEXT_MSG="One or more update tasks encountered errors."
+    [ -n "$SUMMARY_LINES" ] && TEXT_MSG="${TEXT_MSG}\n\nResults: ${SUMMARY_LINES}"
+    [ "$ENABLE_LOGGING" = "TRUE" ] && [ -n "$LOG_FILE" ] && TEXT_MSG="${TEXT_MSG}\n\nCheck log for details:\n$LOG_FILE"
+
+    if [ "$GUI_ENGINE" = "yad" ]; then
+        yad --error --title="Update Errors" --text="$TEXT_MSG" --window-icon="dialog-error"
+    else
+        zenity --error --title="Update Errors" --text="$TEXT_MSG" --icon="dialog-error"
+    fi
+fi
+
+# Print summary and log file path to terminal if running interactively
+if [ -t 1 ]; then
+    [ -n "$SUMMARY_LINES" ] && printf 'Update summary: %s\n' "$SUMMARY_LINES"
+    if [ "$ENABLE_LOGGING" = "TRUE" ] && [ -n "$LOG_FILE" ]; then
+        printf 'Log saved to: %s\n' "$LOG_FILE"
+    fi
+fi
+
+# 7. Reboot Check (Evaluated independently of partial failures in other managers)
+REBOOT_NEEDED="FALSE"
+if [ -f /var/run/reboot-required ]; then
+    REBOOT_NEEDED="TRUE"
+fi
+
+if [ "$REBOOT_NEEDED" = "TRUE" ]; then
+    REBOOT_CHOICE=1
+    if [ "$GUI_ENGINE" = "yad" ]; then
+        yad --image="dialog-question" \
+            --title="Reboot Required" \
+            --text="Your system indicates that a reboot is required to complete pending updates.\n\nWould you like to restart your computer now?" \
+            --button="Later:1" \
+            --button="Reboot Now:0" \
+            --window-icon="system-reboot"
+        REBOOT_CHOICE=$?
+    else
+        zenity --question \
+               --title="Reboot Required" \
+               --text="Your system indicates that a reboot is required to complete pending updates.\n\nWould you like to restart your computer now?" \
+               --width=380 \
+               --ok-label="Reboot Now" \
+               --cancel-label="Later" \
+               --icon="system-reboot"
+        REBOOT_CHOICE=$?
+    fi
+
+    if [ "$REBOOT_CHOICE" -eq 0 ]; then
+        # If sudo session expired during a long update and PASS_FILE was not created, prompt once
+        if ! sudo -n true 2>/dev/null && { [ -z "$PASS_FILE" ] || [ ! -f "$PASS_FILE" ]; }; then
+            if [ "$GUI_ENGINE" = "yad" ]; then
+                REBOOT_PASS=$(yad --entry --hide-text \
+                    --title="Authentication Required" \
+                    --text="Enter administrative password to restart:" \
+                    --width=380 \
+                    --window-icon="dialog-password")
+            else
+                REBOOT_PASS=$(zenity --password \
+                    --title="Authentication Required" \
+                    --icon="dialog-password")
+            fi
+            if [ -n "$REBOOT_PASS" ]; then
+                printf '%s\n' "$REBOOT_PASS" | sudo -S -v 2>/dev/null || true
+                unset REBOOT_PASS
+            fi
+        fi
+
+        send_notification "normal" "System Rebooting" "Restarting system in 2 seconds..." "system-reboot"
+        sleep 2
+
+        REBOOT_RC=0
+        if command -v systemctl >/dev/null 2>&1; then
+            run_privileged systemctl reboot
+            REBOOT_RC=$?
+        else
+            run_privileged reboot
+            REBOOT_RC=$?
+        fi
+
+        if [ "$REBOOT_RC" -ne 0 ]; then
+            play_sound "error"
+            if [ "$GUI_ENGINE" = "yad" ]; then
+                yad --error --title="Reboot Failed" --text="Failed to initiate system reboot." --window-icon="dialog-error"
+            else
+                zenity --error --title="Reboot Failed" --text="Failed to initiate system reboot." --icon="dialog-error"
+            fi
+        fi
+    fi
+fi
+
+if [ -n "${SOUND_PID:-}" ]; then
+    wait "$SOUND_PID" 2>/dev/null || true
+fi
+
+cleanup_resources
