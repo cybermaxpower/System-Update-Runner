@@ -42,6 +42,15 @@ When Yay is installed, the script avoids presenting duplicate Pacman and Yay upd
 
 The package managers themselves are only required if you intend to update software managed by them.
 
+## Testing
+
+System Update Runner has been tested on the following Linux distributions:
+
+- **MX Linux** — using Zenity.
+- **EndeavourOS** — using YAD.
+
+Other distributions may work, provided the required package managers and graphical dependencies are available.
+
 ## Installation
 
 System Update Runner can be installed system-wide so it can be launched from any terminal location.
@@ -52,33 +61,31 @@ Download `system-updater-runner` from this repository.
 
 ### 2. Install it system-wide
 
-Open a terminal in the directory containing the downloaded script and run:
+## Installation
+
+System Update Runner includes an installation script that downloads the application and installs it system-wide.
+
+### Quick Install
+
+Open a terminal and run:
 
 ```bash
-sudo install -m 755 system-updater-runner /usr/local/bin/system-updater-runner
+wget -O install-system-update-runner.sh https://raw.githubusercontent.com/cybermaxpower/System-Update-Runner/main/install-system-update-runner.sh
+
+bash install-system-update-runner.sh
 ```
 
-This installs the script in `/usr/local/bin` and sets the appropriate executable permissions.
+The installer downloads the application, installs the icon and creates an application menu entry.
 
-### 3. Launch the application
+You do not need to run the installer as root. It requests administrative permission when required.
 
-Once installed, run:
+### Launching the Application
 
-```bash
+Once installed, launch System Update Runner from your application menu or run:
+
+\`\`\`bash
 system-updater-runner
-```
-
-You do not need to run the script as root. It launches as your normal user and requests administrative authentication when required.
-
-## Quick Install
-
-If you have downloaded the script into your Downloads directory, you can install it with:
-
-```bash
-sudo install -m 755 ~/Downloads/system-updater-runner /usr/local/bin/system-updater-runner
-```
-
-If your download is located elsewhere, adjust the source path accordingly.
+\`\`\`
 
 ## Usage
 
