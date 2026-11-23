@@ -83,9 +83,9 @@ You do not need to run the installer as root. It requests administrative permiss
 
 Once installed, launch System Update Runner from your application menu or run:
 
-\`\`\`bash
+```bash
 system-updater-runner
-\`\`\`
+```
 
 ## Usage
 
