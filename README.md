@@ -1,51 +1,183 @@
 # System Update Runner
 
-A lightweight Linux GUI system update manager written in Bash using **Zenity** (with **YAD** as a fallback) to update packages across multiple package managers from a single interface.
-
-## Supported Package Managers
-
-- **APT** — Debian and Ubuntu-based distributions (`apt-get update` followed by `apt-get upgrade -y`)
-- **Pacman** — Arch-based distributions (`pacman -Syu --noconfirm`)
-- **Yay** — Arch packages and AUR (`yay -Syu --noconfirm`, with `SUDO_ASKPASS` support for non-interactive GUI runs)
-- **Flatpak** — Flatpak applications (`flatpak update -y`)
-- **Snap** — Snap packages (`snap refresh`)
+A lightweight Linux GUI system update manager written in Bash, using **Zenity** (preferred) or **YAD** as a fallback. System Update Runner provides a simple graphical interface for updating packages across multiple package managers from one place.
 
 ## Features
 
-- **Dynamic detection:** Automatically detects installed package managers and builds the selection checklist accordingly (avoiding duplicate Pacman + Yay entries when `yay` is installed).
-- **Live status ticker:** Translates package-manager output into readable progress status messages inside a Zenity or YAD progress dialog.
-- **Decoupled update worker:** Runs updates in a background worker and tails output to the GUI so closing the progress window does not interrupt active package operations.
-- **Per-manager result reporting:** Tracks and reports individual manager statuses (`OK` or `Failed`) rather than hiding partial failures.
-- **Optional logging:** Supports `-l`, `--log`, or `/l` to save logs under `~/.local/share/system-updater/logs/` and automatically removes logs older than 30 days.
-- **Notifications & sound:** Optional desktop notifications (`notify-send`) and completion/error chimes (`paplay`, `pw-play`, or `aplay`) when available.
-- **Reboot prompt:** Checks `/var/run/reboot-required` and prompts before rebooting if requested.
+- **Dynamic package-manager detection:** Automatically detects installed package managers and builds the selection list accordingly.
+- **Multiple package managers:** Supports APT, Pacman, Yay, Flatpak and Snap.
+- **Live status ticker:** Converts package-manager output into readable status messages displayed in a graphical progress dialog.
+- **Background update worker:** Runs updates independently of the GUI progress window, so closing the progress window does not intentionally interrupt active package operations.
+- **Per-manager result reporting:** Reports individual package-manager results, making partial failures easier to identify.
+- **Optional logging:** Use `-l`, `--log`, or `/l` to save update logs under `~/.local/share/system-updater/logs/`. Logs older than 30 days are automatically removed.
+- **Desktop notifications:** Sends completion or error notifications when `notify-send` is available.
+- **Sound feedback:** Supports optional completion/error sounds using `paplay`, `pw-play`, or `aplay`, when available.
+- **Reboot detection:** Checks for `/var/run/reboot-required` and offers a reboot prompt when necessary.
+
+## Supported Package Managers
+
+| Package Manager | Supported Systems | Update Command |
+|---|---|---|
+| APT | Debian, Ubuntu and derivatives | `apt-get update` followed by `apt-get upgrade -y` |
+| Pacman | Arch Linux and derivatives | `pacman -Syu --noconfirm` |
+| Yay | Arch-based systems with Yay installed | `yay -Syu --noconfirm` |
+| Flatpak | Linux distributions with Flatpak | `flatpak update -y` |
+| Snap | Linux distributions with Snap | `snap refresh` |
+
+When Yay is installed, the script avoids presenting duplicate Pacman and Yay update options where appropriate.
 
 ## Requirements
 
-- `bash`
-- `zenity` (preferred) or `yad` (fallback)
-- `sudo` (required when updating APT, Pacman, Yay, or Snap)
-- Optional: `notify-send` for desktop notifications; `paplay`, `pw-play`, or `aplay` for sound feedback
+### Required
+
+- Bash
+- Zenity or YAD
+- `sudo` for privileged package-manager operations
+
+### Optional
+
+- `notify-send` — desktop notifications
+- `paplay`, `pw-play` or `aplay` — sound feedback
+- `flock` — prevents multiple instances from running simultaneously
+
+The package managers themselves are only required if you intend to update software managed by them.
+
+## Installation
+
+System Update Runner can be installed system-wide so it can be launched from any terminal location.
+
+### 1. Download the script
+
+Download `system-updater-runner` from this repository.
+
+### 2. Install it system-wide
+
+Open a terminal in the directory containing the downloaded script and run:
+
+```bash
+sudo install -m 755 system-updater-runner /usr/local/bin/system-updater-runner
+```
+
+This installs the script in `/usr/local/bin` and sets the appropriate executable permissions.
+
+### 3. Launch the application
+
+Once installed, run:
+
+```bash
+system-updater-runner
+```
+
+You do not need to run the script as root. It launches as your normal user and requests administrative authentication when required.
+
+## Quick Install
+
+If you have downloaded the script into your Downloads directory, you can install it with:
+
+```bash
+sudo install -m 755 ~/Downloads/system-updater-runner /usr/local/bin/system-updater-runner
+```
+
+If your download is located elsewhere, adjust the source path accordingly.
 
 ## Usage
 
-Make the script executable and run it as a regular user (do not run directly as `root`):
+Launch the application:
 
 ```bash
-chmod +x system-updater-runner
-./system-updater-runner
+system-updater-runner
 ```
+
+Select the package managers you want to update from the graphical checklist and follow the prompts.
 
 ### Enable Logging
 
+To enable logging for an update session:
+
 ```bash
-./system-updater-runner -l
+system-updater-runner --log
 ```
 
-*(Also accepts `--log` or `/l`.)*
+The following options are also supported:
 
-## Author & License
+```bash
+system-updater-runner -l
+system-updater-runner /l
+```
 
-- **Author:** M. Wait ([github.com/cybermaxpower](https://github.com/cybermaxpower))
-- **License:** MIT License
-````[cite: 40]
+Logs are saved under:
+
+```text
+~/.local/share/system-updater/logs/
+```
+
+Log files older than 30 days are automatically removed.
+
+## Uninstallation
+
+To remove the system-wide installation:
+
+```bash
+sudo rm /usr/local/bin/system-updater-runner
+```
+
+This removes the application script but does not remove your log files.
+
+If you also want to remove the saved logs:
+
+```bash
+rm -r ~/.local/share/system-updater
+```
+
+## Troubleshooting
+
+### Neither Zenity nor YAD is installed
+
+Install one of the supported graphical dialog tools using your distribution's package manager.
+
+For example, on Debian/Ubuntu/MX Linux etc:
+
+```bash
+sudo apt install zenity
+```
+
+On Arch Linux:
+
+```bash
+sudo pacman -S yad
+```
+
+### Permission denied
+
+Ensure the script was installed with executable permissions:
+
+```bash
+ls -l /usr/local/bin/system-updater-runner
+```
+
+### Command not found
+
+Check that `/usr/local/bin` is included in your `PATH`:
+
+```bash
+echo "$PATH"
+```
+
+## Safety
+
+- Run System Update Runner as a regular user, **not as root**.
+- Review the package-manager operations your distribution performs.
+- Ensure important data is backed up before performing system updates.
+- Package updates may install, upgrade or remove packages according to your distribution's package-manager behaviour.
+- Closing the graphical progress window does not intentionally terminate an active package update worker.
+
+## Author
+
+**M. Wait**  
+GitHub: [@cybermaxpower](https://github.com/cybermaxpower)
+
+## License
+
+Released under the **MIT License**. See the `LICENSE` file for details."
+
+This preserves the Markdown symbols literally, so it shouldn't render the headings, bold text, tables, or code blocks.
