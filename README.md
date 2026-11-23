@@ -178,6 +178,6 @@ GitHub: [@cybermaxpower](https://github.com/cybermaxpower)
 
 ## License
 
-Released under the **MIT License**. See the `LICENSE` file for details."
+Released under the **MIT License**. See the [LICENSE](https://github.com/cybermaxpower/System-Update-Runner/blob/main/LICENSE) file for details."
 
 This preserves the Markdown symbols literally, so it shouldn't render the headings, bold text, tables, or code blocks.
