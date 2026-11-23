@@ -17,7 +17,7 @@ RAW_BASE="https://raw.githubusercontent.com/cybermaxpower/System-Update-Runner/m
 APP_URL="$RAW_BASE/system-updater-runner"
 
 # This matches the icon's CURRENT filename in the GitHub repository.
-ICON_URL="$RAW_BASE/system-update-runnder.png"
+ICON_URL="$RAW_BASE/system-update-runner.png"
 
 # Installation destinations
 APP_DEST="/usr/local/bin/system-updater-runner"
