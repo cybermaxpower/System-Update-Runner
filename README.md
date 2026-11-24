@@ -53,17 +53,7 @@ Other distributions may work, provided the required package managers and graphic
 
 ## Installation
 
-System Update Runner can be installed system-wide so it can be launched from any terminal location.
-
-### 1. Download the script
-
-Download `system-updater-runner` from this repository.
-
-### 2. Install it system-wide
-
-## Installation
-
-System Update Runner includes an installation script that downloads the application and installs it system-wide.
+System Update Runner includes an installation script that automatically downloads and installs the application system-wide.
 
 ### Quick Install
 
@@ -72,13 +62,6 @@ Open a terminal and run:
 ```bash
 wget -O install-system-update-runner.sh https://raw.githubusercontent.com/cybermaxpower/System-Update-Runner/main/install-system-update-runner.sh
 bash install-system-update-runner.sh
-
-```
-
-The installer downloads the application, installs the icon and creates an application menu entry.
-
-You do not need to run the installer as root. It requests administrative permission when required.
-
 ### Launching the Application
 
 Once installed, launch System Update Runner from your application menu or run:
