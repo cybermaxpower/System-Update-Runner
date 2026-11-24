@@ -70,7 +70,7 @@ bash install-system-update-runner.sh
 
 ## Launching the Application
 
-Once installed, launch System Update Runner from your application menu or run:
+### Once installed, you can launch System Update Runner from your desktop's **Applications menu** or run it from the terminal:
 
 ```bash
 system-updater-runner
@@ -98,7 +98,6 @@ Logs are saved under:
 ```text
 ~/.local/share/system-updater/logs/
 ```
-
 Log files older than 30 days are automatically removed.
 
 ## Uninstallation
