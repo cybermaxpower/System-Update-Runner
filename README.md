@@ -62,6 +62,8 @@ Open a terminal and run:
 ```bash
 wget -O install-system-update-runner.sh https://raw.githubusercontent.com/cybermaxpower/System-Update-Runner/main/install-system-update-runner.sh
 bash install-system-update-runner.sh
+```
+
 ### Launching the Application
 
 Once installed, launch System Update Runner from your application menu or run:
