@@ -68,7 +68,7 @@ wget -O install-system-update-runner.sh https://raw.githubusercontent.com/cyberm
 bash install-system-update-runner.sh
 ```
 
-### Launching the Application
+## Launching the Application
 
 Once installed, launch System Update Runner from your application menu or run:
 
