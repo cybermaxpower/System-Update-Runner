@@ -1,5 +1,9 @@
 # System Update Runner
 
+<p align="center">
+  <img src="stylise_preview.png" alt="System Update Runner Preview" width="700">
+</p>
+
 A lightweight Linux GUI system update manager written in Bash, using **Zenity** (preferred) or **YAD** as a fallback. System Update Runner provides a simple graphical interface for updating packages across multiple package managers from one place.
 
 ## Features
