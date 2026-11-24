@@ -76,14 +76,6 @@ Once installed, launch System Update Runner from your application menu or run:
 system-updater-runner
 ```
 
-## Usage
-
-Launch the application:
-
-```bash
-system-updater-runner
-```
-
 Select the package managers you want to update from the graphical checklist and follow the prompts.
 
 ### Enable Logging
