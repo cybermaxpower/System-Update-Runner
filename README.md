@@ -71,10 +71,8 @@ Open a terminal and run:
 
 ```bash
 wget -O install-system-update-runner.sh https://raw.githubusercontent.com/cybermaxpower/System-Update-Runner/main/install-system-update-runner.sh
-
-chmod +x install-system-update-runner.sh
-
 bash install-system-update-runner.sh
+
 ```
 
 The installer downloads the application, installs the icon and creates an application menu entry.
